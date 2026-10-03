@@ -248,7 +248,7 @@ impl LookupTable {
     let delta = sdelta as u32;
     let pixel = base + ((delta * (*rand & 2047) + 1024) >> 12);
     *rand = 15700 * (*rand & 65535) + (*rand >> 16);
-    pixel as u16
+    pixel.min(u16::MAX as u32) as u16
   }
 }
 
@@ -351,6 +351,38 @@ pub(crate) fn extend_binary_floating_point<NARROW: FloatingPointParameters, WIDE
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn dither_saturates_highlights_without_changing_random_state() {
+    let table = LookupTable::new(&[65407, 65535]);
+    for seed in 0..2048 {
+      let mut random = seed;
+      assert!(table.dither(1, &mut random) >= 65503, "highlight wrapped for seed {seed}");
+      assert_eq!(random, 15700 * seed);
+    }
+    assert_eq!(table.dither(1, &mut 2047), u16::MAX);
+  }
+
+  #[test]
+  fn dither_preserves_unsaturated_samples() {
+    let table = LookupTable::new(&[1000, 2000, 4000, 8000]);
+    for (index, seed, expected) in [
+      (0, 0, 750),
+      (0, 1024, 1000),
+      (1, 0, 1250),
+      (1, 1024, 2000),
+      (2, 0, 2500),
+      (2, 1024, 4000),
+      (3, 0, 7000),
+      (3, 1024, 8000),
+    ] {
+      let mut random = seed;
+      assert_eq!(table.dither(index, &mut random), expected);
+    }
+    let mut random = 65536;
+    assert_eq!(table.dither(0, &mut random), 750);
+    assert_eq!(random, 1);
+  }
 
   #[test]
   fn test_convert() {
