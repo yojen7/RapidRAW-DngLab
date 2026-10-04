@@ -226,6 +226,9 @@ pub struct RawImage {
   pub active_area: Option<Rect>,
   /// how much to crop the image to get all the recommended area
   pub crop_area: Option<Rect>,
+  /// Full recommended image area when crop_area selects an in-camera aspect crop.
+  /// Editors can retain this area and apply crop_area non-destructively.
+  pub default_crop_area: Option<Rect>,
 
   /// Areas of the sensor that is masked to prevent it from receiving light. Used to calculate
   /// black levels and noise.
@@ -385,6 +388,7 @@ impl RawImage {
       photometric,
       active_area,
       crop_area,
+      default_crop_area: None,
       blackareas,
       orientation: Orientation::Normal, //cam.orientation, // TODO fixme
       color_matrix: cam.color_matrix,
@@ -474,6 +478,7 @@ impl RawImage {
       photometric,
       active_area,
       crop_area,
+      default_crop_area: None,
       blackareas,
       orientation: Orientation::Normal, //cam.orientation, // TODO fixme
       color_matrix: cam.color_matrix,

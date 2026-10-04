@@ -196,6 +196,15 @@ impl<'a> Decoder for ArwDecoder<'a> {
     }
     img.crop_area = Rect::from_tiff(raw).or_else(|| self.camera.crop_area.map(|area| Rect::new_with_borders(Dim2::new(width, height), &area)));
 
+    let default_area = img
+      .crop_area
+      .or(img.active_area)
+      .unwrap_or(Rect::new(Point::new(0, 0), Dim2::new(width, height)));
+    if let Some(crop) = sony_aspect_crop(raw, default_area, img.active_area, img.dim()) {
+      img.default_crop_area = Some(default_area);
+      img.crop_area = Some(crop);
+    }
+
     log::debug!("raw dim: {}x{}", width, height);
     log::debug!("crop_area: {:?}", img.crop_area);
     log::debug!("active_area: {:?}", img.active_area);
@@ -794,4 +803,99 @@ pub enum SR2SubIFD {
   BlackLevel1 = 0x7300,
   BlackLevel2 = 0x7310,
   WhiteLevel = 0x787f,
+}
+
+// Sony stores the selected aspect rectangle separately from the full-image
+// DefaultCrop tags. Validate it in decoded coordinates (including M/S RAWs).
+fn sony_aspect_crop(raw: &IFD, default_area: Rect, active_area: Option<Rect>, dim: Dim2) -> Option<Rect> {
+  fn pair(value: &Value) -> Option<(usize, usize)> {
+    match value {
+      Value::Short(v) if v.len() == 2 => Some((usize::from(v[0]), usize::from(v[1]))),
+      Value::Long(v) if v.len() == 2 => Some((usize::try_from(v[0]).ok()?, usize::try_from(v[1]).ok()?)),
+      _ => None,
+    }
+  }
+  fn contains(outer: Rect, inner: Rect) -> Option<bool> {
+    Some(
+      inner.p.x >= outer.p.x
+        && inner.p.y >= outer.p.y
+        && inner.p.x.checked_add(inner.d.w)? <= outer.p.x.checked_add(outer.d.w)?
+        && inner.p.y.checked_add(inner.d.h)? <= outer.p.y.checked_add(outer.d.h)?,
+    )
+  }
+  let (x, y) = pair(&raw.get_entry(TiffCommonTag::SonyCropTopLeft)?.value)?;
+  let (w, h) = pair(&raw.get_entry(TiffCommonTag::SonyCropSize)?.value)?;
+  let crop = Rect::new(Point::new(x, y), Dim2::new(w, h));
+  if w == 0
+    || h == 0
+    || (w == default_area.d.w && h == default_area.d.h)
+    || !contains(Rect::new(Point::new(0, 0), dim), default_area)?
+    || !contains(default_area, crop)?
+    || !contains(active_area.unwrap_or(Rect::new(Point::new(0, 0), dim)), crop)?
+  {
+    return None;
+  }
+  Some(crop)
+}
+
+#[cfg(test)]
+mod aspect_crop_tests {
+  use super::*;
+
+  fn tags(origin: Value, size: Value) -> IFD {
+    let mut ifd = IFD::default();
+    for (tag, value) in [(TiffCommonTag::SonyCropTopLeft, origin), (TiffCommonTag::SonyCropSize, size)] {
+      ifd.entries.insert(
+        tag.into(),
+        Entry {
+          tag: tag.into(),
+          value,
+          embedded: None,
+        },
+      );
+    }
+    ifd
+  }
+
+  #[test]
+  fn sony_selected_aspects_use_absolute_sensor_coordinates() {
+    let default = Rect::new(Point::new(12, 8), Dim2::new(7008, 4672));
+    for (x, y, w, h) in [(404, 8, 6224, 4672), (1180, 8, 4672, 4672), (12, 373, 7008, 3942)] {
+      let raw = tags(Value::Short(vec![x, y]), Value::Long(vec![w, h]));
+      assert_eq!(
+        sony_aspect_crop(&raw, default, None, Dim2::new(7168, 5120)),
+        Some(Rect::new(Point::new(x.into(), y.into()), Dim2::new(w as usize, h as usize)))
+      );
+    }
+  }
+
+  #[test]
+  fn full_aspect_and_missing_tags_preserve_default_crop() {
+    let default = Rect::new(Point::new(44, 30), Dim2::new(4608, 3072));
+    let raw = tags(Value::Short(vec![44, 30]), Value::Long(vec![4608, 3072]));
+    assert_eq!(sony_aspect_crop(&raw, default, None, Dim2::new(4748, 3164)), None);
+    assert_eq!(sony_aspect_crop(&IFD::default(), default, None, Dim2::new(4748, 3164)), None);
+    let raw = tags(Value::Short(vec![812, 30]), Value::Long(vec![3072, 3072]));
+    assert!(sony_aspect_crop(&raw, default, None, Dim2::new(4748, 3164)).is_some());
+  }
+
+  #[test]
+  fn malformed_and_out_of_bounds_tags_do_not_replace_default() {
+    let default = Rect::new(Point::new(12, 8), Dim2::new(7008, 4672));
+    for (origin, size) in [
+      (Value::Short(vec![404]), Value::Long(vec![6224, 4672])),
+      (Value::Short(vec![404, 8]), Value::Long(vec![6224])),
+      (Value::SLong(vec![-1, 8]), Value::Long(vec![6224, 4672])),
+      (Value::Short(vec![404, 8]), Value::Long(vec![0, 4672])),
+      (Value::Short(vec![404, 8]), Value::Long(vec![7008, 4672])),
+      (Value::Long(vec![u32::MAX, 8]), Value::Long(vec![6224, 4672])),
+      (Value::Short(vec![404, 0]), Value::Long(vec![6224, 4672])),
+    ] {
+      assert_eq!(sony_aspect_crop(&tags(origin, size), default, None, Dim2::new(7168, 5120)), None);
+    }
+    let raw = tags(Value::Short(vec![404, 8]), Value::Long(vec![6224, 4672]));
+    let small_active = Rect::new(Point::new(500, 8), Dim2::new(6100, 4672));
+    assert_eq!(sony_aspect_crop(&raw, default, Some(small_active), Dim2::new(7168, 5120)), None);
+    assert_eq!(sony_aspect_crop(&raw, default, None, Dim2::new(4748, 3164)), None);
+  }
 }
