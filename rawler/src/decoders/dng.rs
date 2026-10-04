@@ -1,3 +1,4 @@
+mod opcodes;
 use crate::RawImage;
 use crate::cfa::*;
 use crate::decoders::*;
@@ -74,15 +75,14 @@ impl<'a> Decoder for DngDecoder<'a> {
     let raw_data = if dummy {
       RawImageData::Integer(Vec::new())
     } else {
-      let mut data = plain_image_from_ifd(raw, file)?;
-      if proxy.is_some() {
-        apply_map_polynomial_opcodes(raw, &mut data, width, cpp, bits);
-      }
-      data
+      plain_image_from_ifd(raw, file)?
     };
     let wb_coeffs = self.get_wb(&cam)?;
     let mut image = RawImage::new_with_data(cam, raw_data, width * cpp, height, cpp, wb_coeffs, photometric, blacklevel, whitelevel, dummy);
     image.orientation = orientation;
+    if proxy.is_some() && !dummy {
+      opcodes::apply_stage2(raw, &mut image)?;
+    }
     Ok(image)
   }
 
@@ -486,172 +486,5 @@ impl<'a> DngDecoder<'a> {
     // TODO: add 3
 
     Ok(result)
-  }
-}
-
-fn apply_map_polynomial_opcodes(ifd: &IFD, data: &mut RawImageData, width: usize, cpp: usize, bits: u32) {
-  if let Some(entry) = ifd.get_entry(DngTag::OpcodeList2) {
-    apply_map_polynomial(entry.value.get_data(), data, width, cpp, bits);
-  }
-}
-
-fn apply_map_polynomial(buf: &[u8], data: &mut RawImageData, width: usize, cpp: usize, bits: u32) {
-  let u32_at = |o: usize| buf.get(o..o + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
-  let f64_at = |o: usize| buf.get(o..o + 8).map(|b| f64::from_be_bytes(b.try_into().unwrap()));
-
-  let Some(count) = u32_at(0) else {
-    return;
-  };
-  let mut offset = 4;
-  for _ in 0..count {
-    let (Some(id), Some(size)) = (u32_at(offset), u32_at(offset + 12)) else {
-      return;
-    };
-    let p = offset + 16;
-    offset = p.saturating_add(size as usize);
-    if id != 8 {
-      log::debug!("DNG proxy: ignoring OpcodeList2 opcode {}", id);
-      continue;
-    }
-    let params: Option<Vec<u32>> = (0..9).map(|i| u32_at(p + i * 4)).collect();
-    let Some([top, left, bottom, right, plane, planes, row_pitch, col_pitch, degree]) = params.and_then(|v| <[u32; 9]>::try_from(v).ok()) else {
-      return;
-    };
-    let Some(coeffs) = (0..=degree as usize).map(|i| f64_at(p + 36 + i * 8)).collect::<Option<Vec<f64>>>() else {
-      return;
-    };
-    let eval = |x: f64| coeffs.iter().rev().fold(0.0, |acc, c| acc * x + c);
-    let height = match data {
-      RawImageData::Integer(v) => v.len(),
-      RawImageData::Float(v) => v.len(),
-    } / (width * cpp).max(1);
-    let (row_pitch, col_pitch) = (row_pitch.max(1) as usize, col_pitch.max(1) as usize);
-    let planes = plane as usize..(plane.saturating_add(planes) as usize).min(cpp);
-    let int_max = if (1..=16).contains(&bits) { ((1u32 << bits) - 1) as f64 } else { u16::MAX as f64 };
-    for row in (top as usize..(bottom as usize).min(height)).step_by(row_pitch) {
-      for col in (left as usize..(right as usize).min(width)).step_by(col_pitch) {
-        for c in planes.clone() {
-          let idx = (row * width + col) * cpp + c;
-          match data {
-            RawImageData::Integer(v) => {
-              let x = v[idx] as f64 / int_max;
-              v[idx] = (eval(x) * int_max).round().clamp(0.0, int_max) as u16;
-            }
-            RawImageData::Float(v) => v[idx] = eval(v[idx] as f64) as f32,
-          }
-        }
-      }
-    }
-  }
-}
-
-#[cfg(test)]
-mod map_polynomial_tests {
-  use super::*;
-
-  fn opcode(id: u32, params: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    for x in [id, 0x0103_0000, 0, params.len() as u32] {
-      v.extend_from_slice(&x.to_be_bytes());
-    }
-    v.extend_from_slice(params);
-    v
-  }
-
-  fn map_poly(area: [u32; 4], plane: u32, planes: u32, pitch: (u32, u32), coeffs: &[f64]) -> Vec<u8> {
-    let mut p = Vec::new();
-    for x in [area[0], area[1], area[2], area[3], plane, planes, pitch.0, pitch.1, coeffs.len() as u32 - 1] {
-      p.extend_from_slice(&x.to_be_bytes());
-    }
-    for c in coeffs {
-      p.extend_from_slice(&c.to_be_bytes());
-    }
-    opcode(8, &p)
-  }
-
-  fn list(ops: &[Vec<u8>]) -> Vec<u8> {
-    let mut v = (ops.len() as u32).to_be_bytes().to_vec();
-    ops.iter().for_each(|o| v.extend_from_slice(o));
-    v
-  }
-
-  fn ints(data: &RawImageData) -> &[u16] {
-    match data {
-      RawImageData::Integer(v) => v,
-      _ => panic!("expected integer data"),
-    }
-  }
-
-  #[test]
-  fn quadratic_per_plane_16bit() {
-    let ops = list(&[map_poly([0, 0, 1, 2], 0, 1, (1, 1), &[0.0, 0.0, 1.0]), map_poly([0, 0, 1, 2], 1, 1, (1, 1), &[0.5])]);
-    let mut data = RawImageData::Integer(vec![32768, 1000, 7, 65535, 2000, 9]);
-    apply_map_polynomial(&ops, &mut data, 2, 3, 16);
-    assert_eq!(ints(&data), &[16384, 32768, 7, 65535, 32768, 9]);
-  }
-
-  #[test]
-  fn normalizes_to_bit_depth() {
-    let ops = list(&[map_poly([0, 0, 1, 1], 0, 1, (1, 1), &[0.0, 0.5])]);
-    let mut data = RawImageData::Integer(vec![255]);
-    apply_map_polynomial(&ops, &mut data, 1, 1, 8);
-    assert_eq!(ints(&data), &[128]);
-  }
-
-  #[test]
-  fn respects_area_and_pitch() {
-    let ops = list(&[map_poly([1, 0, 4, 4], 0, 1, (2, 2), &[0.0])]);
-    let mut data = RawImageData::Integer(vec![100; 16]);
-    apply_map_polynomial(&ops, &mut data, 4, 1, 16);
-    let changed: Vec<usize> = ints(&data).iter().enumerate().filter(|(_, v)| **v == 0).map(|(i, _)| i).collect();
-    assert_eq!(changed, vec![4, 6, 12, 14]);
-  }
-
-  #[test]
-  fn clamps_output_and_handles_float() {
-    let ops = list(&[map_poly([0, 0, 1, 2], 0, 1, (1, 1), &[-1.0, 3.0])]);
-    let mut data = RawImageData::Integer(vec![0, 65535]);
-    apply_map_polynomial(&ops, &mut data, 2, 1, 16);
-    assert_eq!(ints(&data), &[0, 65535]);
-    let mut data = RawImageData::Float(vec![0.5, 1.0]);
-    apply_map_polynomial(&ops, &mut data, 2, 1, 16);
-    let RawImageData::Float(v) = data else { panic!("expected float data") };
-    assert_eq!(v, vec![0.5, 2.0]);
-  }
-
-  #[test]
-  fn skips_other_opcodes() {
-    let ops = list(&[opcode(1, &[1, 2, 3, 4, 5]), map_poly([0, 0, 1, 1], 0, 1, (1, 1), &[0.0])]);
-    let mut data = RawImageData::Integer(vec![500]);
-    apply_map_polynomial(&ops, &mut data, 1, 1, 16);
-    assert_eq!(ints(&data), &[0]);
-  }
-
-  #[test]
-  fn malformed_lists_do_not_panic() {
-    let good = map_poly([0, 0, 1, 1], 0, 1, (1, 1), &[0.0]);
-    let cases: Vec<Vec<u8>> = vec![
-      vec![],                                                           // empty
-      vec![0, 0, 0, 5],                                                 // count without opcodes
-      list(&[good.clone()])[..20].to_vec(),                             // truncated params
-      list(&[map_poly([0, 0, 1, 1], u32::MAX, u32::MAX, (1, 1), &[0.0])]), // plane overflow
-      list(&[map_poly([0, 0, u32::MAX, u32::MAX], 0, 1, (0, 0), &[0.0])]), // huge area, zero pitch
-      list(&[opcode(8, &{
-        let mut p = vec![0u8; 32];
-        p.extend_from_slice(&u32::MAX.to_be_bytes()); // degree u32::MAX, no coefficients
-        p
-      })]),
-      list(&[opcode(1, &[]), {
-        let mut o = opcode(8, &[]);
-        o[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // size pointing far past the end
-        o
-      }]),
-    ];
-    for case in cases {
-      let mut data = RawImageData::Integer(vec![500; 4]);
-      apply_map_polynomial(&case, &mut data, 2, 1, 16);
-      let mut empty = RawImageData::Integer(vec![]);
-      apply_map_polynomial(&case, &mut empty, 2, 1, 16);
-    }
   }
 }
