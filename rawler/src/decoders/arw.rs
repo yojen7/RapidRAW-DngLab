@@ -823,8 +823,8 @@ fn sony_aspect_crop(raw: &IFD, default_area: Rect, active_area: Option<Rect>, di
         && inner.p.y.checked_add(inner.d.h)? <= outer.p.y.checked_add(outer.d.h)?,
     )
   }
-  let (x, y) = pair(&raw.get_entry(TiffCommonTag::SonyCropTopLeft)?.value)?;
-  let (w, h) = pair(&raw.get_entry(TiffCommonTag::SonyCropSize)?.value)?;
+  let (x, y) = pair(&raw.get_entry(ExifTag::SonyCropTopLeft)?.value)?;
+  let (w, h) = pair(&raw.get_entry(ExifTag::SonyCropSize)?.value)?;
   let crop = Rect::new(Point::new(x, y), Dim2::new(w, h));
   if w == 0
     || h == 0
@@ -844,7 +844,7 @@ mod aspect_crop_tests {
 
   fn tags(origin: Value, size: Value) -> IFD {
     let mut ifd = IFD::default();
-    for (tag, value) in [(TiffCommonTag::SonyCropTopLeft, origin), (TiffCommonTag::SonyCropSize, size)] {
+    for (tag, value) in [(ExifTag::SonyCropTopLeft, origin), (ExifTag::SonyCropSize, size)] {
       ifd.entries.insert(
         tag.into(),
         Entry {
