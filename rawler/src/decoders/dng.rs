@@ -12,6 +12,8 @@ use crate::imgop::xyz::*;
 use crate::tags::DngTag;
 use crate::tags::TiffCommonTag;
 
+mod opcodes;
+
 #[derive(Debug, Clone)]
 pub struct DngDecoder<'a> {
   rawloader: &'a RawLoader,
@@ -70,6 +72,9 @@ impl<'a> Decoder for DngDecoder<'a> {
     let wb_coeffs = self.get_wb(&cam)?;
     let mut image = RawImage::new_with_data(cam, raw_data, width * cpp, height, cpp, wb_coeffs, photometric, blacklevel, whitelevel, dummy);
     image.orientation = orientation;
+    if !dummy {
+      opcodes::apply_stage2(raw, &mut image)?;
+    }
     Ok(image)
   }
 
@@ -136,7 +141,10 @@ impl<'a> Decoder for DngDecoder<'a> {
       WellKnownIFD::VirtualDngRawTags => {
         let mut ifd = IFD::default();
         IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::OpcodeList1);
-        IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::OpcodeList2);
+        // Applied stage-2 mappings are baked into decoded pixels, not replayed on conversion.
+        if opcodes::mappings(self.get_raw_ifd()?)?.is_empty() {
+          IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::OpcodeList2);
+        }
         IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::OpcodeList3);
         IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::NoiseProfile);
         IFD::copy_tag(&mut ifd, self.get_raw_ifd()?, DngTag::BayerGreenSplit);
