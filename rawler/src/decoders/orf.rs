@@ -385,14 +385,29 @@ impl<'a> OrfDecoder<'a> {
     out
   }
 
-  fn get_blacklevel(&self, bps: usize) -> Result<Option<BlackLevel>> {
-    let ifd = self.makernote.find_ifds_with_tag(OrfImageProcessing::OrfBlackLevels);
-    if ifd.is_empty() {
-      log::info!("ORF: Couldn't find ImgProc IFD, unable to read blacklevel");
+  fn image_processing_entry(&self, tag: OrfImageProcessing, min_count: u32) -> Result<Option<&Entry>> {
+    // Numeric tags are local to an IFD namespace; CameraSettings reuses them.
+    let Some(ifd) = self.makernote.get_sub_ifd(OrfMakernotes::ImageProcessingIFD) else {
       return Ok(None);
+    };
+    let Some(entry) = ifd.get_entry(tag) else {
+      return Ok(None);
+    };
+    if entry.count() < min_count {
+      return Err(RawlerError::DecoderFailed(format!(
+        "ORF: ImageProcessing {:?} has {} values, expected at least {}",
+        tag,
+        entry.count(),
+        min_count
+      )));
     }
+    Ok(Some(entry))
+  }
 
-    let blacks = fetch_tiff_tag!(ifd[0], OrfImageProcessing::OrfBlackLevels);
+  fn get_blacklevel(&self, bps: usize) -> Result<Option<BlackLevel>> {
+    let Some(blacks) = self.image_processing_entry(OrfImageProcessing::OrfBlackLevels, 4)? else {
+      return Ok(None);
+    };
     let mut levels = [blacks.force_u16(0), blacks.force_u16(1), blacks.force_u16(2), blacks.force_u16(3)];
     if bps == 14 {
       // Blacklevel is encoded for 12 bits
@@ -402,22 +417,22 @@ impl<'a> OrfDecoder<'a> {
   }
 
   fn get_bits_per_pixel(&self) -> Result<Option<u16>> {
-    let ifd = self.makernote.find_ifds_with_tag(OrfImageProcessing::ValidBits);
-    if ifd.is_empty() {
-      return Ok(None);
-    }
-    Ok(Some(fetch_tiff_tag!(ifd[0], OrfImageProcessing::ValidBits).force_u16(0)))
+    Ok(self.image_processing_entry(OrfImageProcessing::ValidBits, 1)?.map(|bits| bits.force_u16(0)))
   }
 
   fn get_crop(&self) -> Result<Option<Rect>> {
-    let ifd = self.makernote.find_ifds_with_tag(OrfImageProcessing::CropLeft);
-    if ifd.is_empty() {
+    let Some(left) = self.image_processing_entry(OrfImageProcessing::CropLeft, 1)? else {
       return Ok(None);
-    }
-    let crop_left = fetch_tiff_tag!(ifd[0], OrfImageProcessing::CropLeft).force_usize(0);
-    let crop_top = fetch_tiff_tag!(ifd[0], OrfImageProcessing::CropTop).force_usize(0);
-    let crop_width = fetch_tiff_tag!(ifd[0], OrfImageProcessing::CropWidth).force_usize(0);
-    let crop_height = fetch_tiff_tag!(ifd[0], OrfImageProcessing::CropHeight).force_usize(0);
+    };
+    let required = |tag| {
+      self
+        .image_processing_entry(tag, 1)?
+        .ok_or_else(|| RawlerError::DecoderFailed(format!("ORF: Missing ImageProcessing {:?}", tag)))
+    };
+    let crop_left = left.force_usize(0);
+    let crop_top = required(OrfImageProcessing::CropTop)?.force_usize(0);
+    let crop_width = required(OrfImageProcessing::CropWidth)?.force_usize(0);
+    let crop_height = required(OrfImageProcessing::CropHeight)?.force_usize(0);
     Ok(Some(Rect::new(Point::new(crop_left, crop_top), Dim2::new(crop_width, crop_height))))
   }
 
@@ -468,11 +483,9 @@ impl<'a> OrfDecoder<'a> {
     match (redmul, bluemul) {
       (Some(redmul), Some(bluemul)) => Ok([redmul.force_u32(0) as f32, 256.0, 256.0, bluemul.force_u32(0) as f32]),
       _ => {
-        let ifd = self.makernote.find_ifds_with_tag(OrfImageProcessing::OrfBlackLevels);
-        if ifd.is_empty() {
-          return Err(RawlerError::DecoderFailed("ORF: Couldn't find ImgProc IFD".to_string()));
-        }
-        let wbs = fetch_tiff_tag!(ifd[0], OrfImageProcessing::WB_RBLevels);
+        let wbs = self
+          .image_processing_entry(OrfImageProcessing::WB_RBLevels, 2)?
+          .ok_or_else(|| RawlerError::DecoderFailed("ORF: ImageProcessing WB_RBLevels missing".to_string()))?;
         Ok([wbs.force_f32(0), 256.0, 256.0, wbs.force_f32(1)])
       }
     }
@@ -536,4 +549,94 @@ pub enum OrfImageProcessing {
 #[repr(u16)]
 pub enum OrfEquipmentTags {
   LensType = 0x0201,
+}
+
+#[cfg(test)]
+mod metadata_scope_tests {
+  use super::*;
+
+  fn entry(ifd: &mut IFD, tag: u16, values: &[u16]) {
+    ifd.entries.insert(
+      tag,
+      Entry {
+        tag,
+        value: Value::Short(values.to_vec()),
+        embedded: None,
+      },
+    );
+  }
+
+  fn decoder(loader: &RawLoader, image_processing: bool) -> OrfDecoder<'_> {
+    let mut settings = IFD::default();
+    entry(&mut settings, 0x0100, &[1]); // PreviewImageValid, not WB_RBLevels
+    entry(&mut settings, 0x0600, &[0, 0, 0, 0]); // DriveMode, not black levels
+    for tag in [0x0611, 0x0612, 0x0613, 0x0614, 0x0615] {
+      entry(&mut settings, tag, &[999]);
+    }
+    let mut maker = IFD::default();
+    maker.sub.insert(OrfMakernotes::CameraSettingsIFD.into(), vec![settings]);
+    if image_processing {
+      let mut processing = IFD::default();
+      entry(&mut processing, OrfImageProcessing::WB_RBLevels.into(), &[618, 438]);
+      entry(&mut processing, OrfImageProcessing::OrfBlackLevels.into(), &[64, 65, 66, 67]);
+      entry(&mut processing, OrfImageProcessing::ValidBits.into(), &[14]);
+      entry(&mut processing, OrfImageProcessing::CropLeft.into(), &[10]);
+      entry(&mut processing, OrfImageProcessing::CropTop.into(), &[20]);
+      entry(&mut processing, OrfImageProcessing::CropWidth.into(), &[640]);
+      entry(&mut processing, OrfImageProcessing::CropHeight.into(), &[480]);
+      maker.sub.insert(OrfMakernotes::ImageProcessingIFD.into(), vec![processing]);
+    }
+    let camera = Camera {
+      cfa: crate::CFA::new("RGGB"),
+      ..Camera::default()
+    };
+    OrfDecoder {
+      rawloader: loader,
+      tiff: GenericTiffReader::default(),
+      camera,
+      makernote: maker,
+    }
+  }
+
+  #[test]
+  fn colliding_settings_tags_never_shadow_image_processing() {
+    let loader = RawLoader::new();
+    for _ in 0..128 {
+      // Fresh HashMap seeds exercise either traversal order.
+      let d = decoder(&loader, true);
+      assert_eq!(d.get_wb().unwrap(), [618., 256., 256., 438.]);
+      assert_eq!(d.get_blacklevel(12).unwrap(), Some(BlackLevel::new(&[64u16, 65, 66, 67], 2, 2, 1)));
+      assert_eq!(d.get_blacklevel(14).unwrap(), Some(BlackLevel::new(&[256u16, 260, 264, 268], 2, 2, 1)));
+      assert_eq!(d.get_bits_per_pixel().unwrap(), Some(14));
+      assert_eq!(d.get_crop().unwrap(), Some(Rect::new(Point::new(10, 20), Dim2::new(640, 480))));
+    }
+  }
+
+  #[test]
+  fn settings_only_are_not_metadata_and_legacy_root_wb_still_works() {
+    let loader = RawLoader::new();
+    let mut d = decoder(&loader, false);
+    assert!(d.get_wb().is_err());
+    assert!(d.get_blacklevel(12).unwrap().is_none());
+    assert!(d.get_bits_per_pixel().unwrap().is_none());
+    assert!(d.get_crop().unwrap().is_none());
+    entry(&mut d.makernote, OrfMakernotes::OlympusRedMul.into(), &[500]);
+    entry(&mut d.makernote, OrfMakernotes::OlympusBlueMul.into(), &[400]);
+    assert_eq!(d.get_wb().unwrap(), [500., 256., 256., 400.]);
+  }
+
+  #[test]
+  fn short_image_processing_fields_are_rejected() {
+    let loader = RawLoader::new();
+    let mut d = decoder(&loader, true);
+    let processing = d.makernote.sub.get_mut(&OrfMakernotes::ImageProcessingIFD.into()).unwrap();
+    entry(&mut processing[0], OrfImageProcessing::WB_RBLevels.into(), &[618]);
+    entry(&mut processing[0], OrfImageProcessing::OrfBlackLevels.into(), &[64, 65, 66]);
+    entry(&mut processing[0], OrfImageProcessing::ValidBits.into(), &[]);
+    entry(&mut processing[0], OrfImageProcessing::CropWidth.into(), &[]);
+    assert!(d.get_wb().is_err());
+    assert!(d.get_blacklevel(12).is_err());
+    assert!(d.get_bits_per_pixel().is_err());
+    assert!(d.get_crop().is_err());
+  }
 }
